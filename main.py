@@ -5,14 +5,23 @@ from SmartApi import SmartConnect
 import requests
 import os
 import time
-from datetime import datetime, timedelta
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# We will fetch the full list dynamically, but for this example, 
-# we use a larger curated list of liquid stocks to avoid excessive API calls.
-# In a production app, you would download the OpenAPIScripMaster.json file.
+# --- MEMORY TO SAVE MONEY ---
+last_ai_signal = None
+last_nifty_price = 0
+last_update_time = 0
+
+INDICES_AND_COMMODITIES = [
+    {"name": "NIFTY 50", "token": "26000", "exchange": "NSE"},
+    {"name": "BANK NIFTY", "token": "26009", "exchange": "NSE"},
+    {"name": "CRUDE OIL", "token": "1140026", "exchange": "MCX"},
+    {"name": "GOLD", "token": "1140027", "exchange": "MCX"},
+    {"name": "SILVER", "token": "1140028", "exchange": "MCX"}
+]
+
 STOCKS_TO_TRACK = [
     {"name": "RELIANCE", "token": "2885"}, {"name": "HDFCBANK", "token": "1333"},
     {"name": "ICICIBANK", "token": "4963"}, {"name": "TCS", "token": "11536"},
@@ -75,6 +84,8 @@ def read_root(): return {"status": "API is running!"}
 
 @app.get("/api/analyze")
 def get_analysis():
+    global last_ai_signal, last_nifty_price, last_update_time
+    
     try:
         API_KEY, CLIENT_CODE = os.environ.get("API_KEY"), os.environ.get("CLIENT_CODE")
         MPIN, TOTP_SECRET = os.environ.get("MPIN"), os.environ.get("TOTP_SECRET")
@@ -86,51 +97,50 @@ def get_analysis():
         
         # 1. Get Indices & Commodities
         indices_data = []
-        indices = [{"name": "NIFTY 50", "token": "26000", "exchange": "NSE"},
-                   {"name": "BANK NIFTY", "token": "26009", "exchange": "NSE"},
-                   {"name": "CRUDE OIL", "token": "1140026", "exchange": "MCX"},
-                   {"name": "GOLD", "token": "1140027", "exchange": "MCX"},
-                   {"name": "SILVER", "token": "1140028", "exchange": "MCX"}]
-        
-        for item in indices:
+        for item in INDICES_AND_COMMODITIES:
             quote = smartApi.ltpData(item["exchange"], item["name"], item["token"])
             if quote['status']:
                 indices_data.append({"name": item["name"], "price": quote['data']['ltp']})
 
-        # 2. Batch Fetch Stock Data (50 at a time, with 1 second delay)
-        bullish, bearish = [], []
-        all_tokens = [s["token"] for s in STOCKS_TO_TRACK]
+        # 2. Get Stocks Breadth
+        tokens = [s["token"] for s in STOCKS_TO_TRACK]
+        quote_data = smartApi.getMarketData("FULL", {"NSE": tokens})
         
-        for i in range(0, len(all_tokens), 50):
-            batch_tokens = all_tokens[i:i+50]
-            quote_data = smartApi.getMarketData("FULL", {"NSE": batch_tokens})
-            
-            if quote_data['status']:
-                for item in quote_data['data']['fetched']:
-                    name = next((s["name"] for s in STOCKS_TO_TRACK if s["token"] == item['symbolToken']), "UNKNOWN")
-                    if item['ltp'] > item['close']: bullish.append(name)
-                    else: bearish.append(name)
-            
-            # Wait 1 second to respect rate limit
-            if i + 50 < len(all_tokens):
-                time.sleep(1)
+        bullish, bearish = [], []
+        if quote_data['status']:
+            for item in quote_data['data']['fetched']:
+                name = next((s["name"] for s in STOCKS_TO_TRACK if s["token"] == item['symbolToken']), "UNKNOWN")
+                if item['ltp'] > item['close']: bullish.append(name)
+                else: bearish.append(name)
 
         total = len(bullish) + len(bearish)
         bull_pct = round((len(bullish) / total) * 100, 1) if total > 0 else 0
         bear_pct = round((len(bearish) / total) * 100, 1) if total > 0 else 0
-
-        # 3. DeepSeek AI
-        nifty_price = next((i["price"] for i in indices_data if i["name"] == "NIFTY 50"), 0)
-        prompt = f"""
-        Nifty is at {nifty_price}. Bullish stocks: {bull_pct}% ({len(bullish)} stocks), Bearish stocks: {bear_pct}% ({len(bearish)} stocks).
-        Act as an aggressive intraday trader. 
-        Give a direct verdict: Should I buy a CALL or a PUT right now? 
-        Provide the exact Target and Stop Loss in 2 sentences. Do not give a neutral answer.
-        """
         
-        headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
-        res = requests.post("https://api.deepseek.com/v1/chat/completions", headers=headers, json={"model": "deepseek-flash", "messages": [{"role": "user", "content": prompt}], "max_tokens": 150})
-        ai_reply = res.json()['choices'][0]['message']['content']
+        nifty_price = next((i["price"] for i in indices_data if i["name"] == "NIFTY 50"), 0)
+        current_time = time.time()
+
+        # 3. SMART DEEPSEEK LOGIC (SAVES MONEY)
+        # Only call AI if price changed by > 5 points, OR if 5 minutes passed
+        if last_ai_signal is None or abs(nifty_price - last_nifty_price) > 5 or (current_time - last_update_time > 300):
+            
+            prompt = f"""
+            Nifty is at {nifty_price}. Bullish stocks: {bull_pct}%, Bearish stocks: {bear_pct}%.
+            Act as an aggressive intraday trader. 
+            Give a direct verdict: Should I buy a CALL or a PUT right now? 
+            Provide the exact Target and Stop Loss in 2 sentences. Do not give a neutral answer.
+            """
+            
+            headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
+            res = requests.post("https://api.deepseek.com/v1/chat/completions", headers=headers, json={"model": "deepseek-flash", "messages": [{"role": "user", "content": prompt}], "max_tokens": 150})
+            
+            # Save the new signal
+            last_ai_signal = res.json()['choices'][0]['message']['content']
+            last_nifty_price = nifty_price
+            last_update_time = current_time
+        else:
+            # Price didn't move enough. Return the OLD signal. (Costs 0 tokens!)
+            pass
 
         return {
             "status": "success",
@@ -139,7 +149,7 @@ def get_analysis():
             "bearish_pct": bear_pct,
             "bullish_list": bullish,
             "bearish_list": bearish,
-            "ai_signal": ai_reply
+            "ai_signal": last_ai_signal
         }
 
     except Exception as e:
