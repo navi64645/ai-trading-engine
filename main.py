@@ -29,43 +29,45 @@ def get_analysis():
         MPIN, TOTP_SECRET = os.environ.get("MPIN"), os.environ.get("TOTP_SECRET")
         DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 
+        # 1. Login
         totp = pyotp.TOTP(TOTP_SECRET)
         smartApi = SmartConnect(api_key=API_KEY)
         data = smartApi.generateSession(CLIENT_CODE, MPIN, totp.now())
-        if not data['status']: return {"error": "Angel One Login Failed"}
+        if not data['status']: return {"error": "Angel One Login Failed", "details": data}
 
-        # 1. Get Nifty Live Data
-        quote = smartApi.getMarketData({"mode": "FULL", "exchangeTokens": {"NSE": ["26000"]}})
-        live_data = quote['data']['fetched'][0]
-        current_price, prev_close = live_data['ltp'], live_data['close']
+        # 2. Get Nifty Live Data (Passing parameters correctly)
+        nifty_quote = smartApi.ltpData("NSE", "NIFTY", "26000")
+        current_price = nifty_quote['data']['ltp']
         
-        # 2. Get Live Expiry Dates for Nifty
-        expiry_data = smartApi.getOptionExpiryDates("NFO", "NIFTY")
-        next_expiry = expiry_data['data'][0] if expiry_data['status'] else "Unknown"
+        # Get previous close for Nifty to calculate change
+        nifty_full = smartApi.getMarketData("FULL", {"NSE": ["26000"]})
+        prev_close = nifty_full['data']['fetched'][0]['close']
+        change = current_price - prev_close
+        change_percent = (change / prev_close) * 100
 
-        # 3. Get Real Option Premium (Find nearest 100 strike price for ATM)
-        atm_strike = int(round(current_price / 100) * 100)
-        search_symbol = f"NIFTY{next_expiry.replace('-', '')[-7:]}{atm_strike}CE" # e.g., NIFTY26OCT22500CE
-        
-        # Fetching live option premium (This searches the NFO market for the option)
-        # Note: For simplicity in this script, we are sending the symbol name. DeepSeek will analyze the price.
-        
-        # 4. Get Historical Chart Data
+        # 3. Get Historical Chart Data
         to_date = datetime.now().strftime("%Y-%m-%d %H:%M")
         from_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d 09:15")
-        hist_data = smartApi.getCandleData({"exchange": "NSE", "symboltoken": "26000", "interval": "FIVE_MINUTE", "fromdate": from_date, "todate": to_date})
-        
+        hist_data = smartApi.getCandleData({
+            "exchange": "NSE", "symboltoken": "26000", "interval": "FIVE_MINUTE", 
+            "fromdate": from_date, "todate": to_date
+        })
         chart_data = [{"time": c[0], "open": float(c[1]), "high": float(c[2]), "low": float(c[3]), "close": float(c[4])} for c in hist_data['data']] if hist_data['status'] else []
 
-        # 5. Stocks Breadth
+        # 4. Get Live Stock Data (Fixing the exchangeTokens format)
+        tokens = [s["token"] for s in STOCKS_TO_TRACK]
+        quote_data = smartApi.getMarketData("FULL", {"NSE": tokens})
+        
         bullish, bearish = [], []
-        for s in STOCKS_TO_TRACK:
-            q = smartApi.getMarketData({"mode": "FULL", "exchangeTokens": {s["exchange"]: [s["token"]]}})
-            if q['status'] and q['data']['fetched'][0]['ltp'] > q['data']['fetched'][0]['close']: bullish.append(s["name"])
-            else: bearish.append(s["name"])
+        if quote_data['status']:
+            for item in quote_data['data']['fetched']:
+                # Match the fetched token back to the stock name
+                stock_name = next((s["name"] for s in STOCKS_TO_TRACK if s["token"] == item['symbolToken']), "UNKNOWN")
+                if item['ltp'] > item['close']: bullish.append(stock_name)
+                else: bearish.append(stock_name)
 
-        # 6. DeepSeek AI
-        prompt = f"Nifty is at {current_price}. Next expiry is {next_expiry}. Act as an expert Indian trader. Give a 2-sentence analysis. Mention {len(bullish)} stocks are bullish and {len(bearish)} are bearish."
+        # 5. DeepSeek AI
+        prompt = f"Nifty is at {current_price} (Change: {change:.2f}). Act as an expert Indian trader. Give a short 2-sentence analysis. Mention {len(bullish)} stocks are bullish and {len(bearish)} are bearish."
         headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
         res = requests.post("https://api.deepseek.com/v1/chat/completions", headers=headers, json={"model": "deepseek-flash", "messages": [{"role": "user", "content": prompt}], "max_tokens": 500})
         ai_reply = res.json()['choices'][0]['message']['content']
@@ -73,8 +75,8 @@ def get_analysis():
         return {
             "status": "success",
             "nifty_price": current_price,
-            "next_expiry": next_expiry, # Real Date
-            "atm_strike": atm_strike,   # Real Strike
+            "change": change,
+            "change_percent": change_percent,
             "analysis": ai_reply,
             "bullish_list": bullish,
             "bearish_list": bearish,
